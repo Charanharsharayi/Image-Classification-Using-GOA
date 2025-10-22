@@ -1,0 +1,293 @@
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.autograd import Variable
+from PIL import Image
+import os
+import numpy as np
+import cv2  # OpenCV for handcrafted features
+import math
+
+# --- Check for optional dependencies ---
+try:
+    from skimage.feature import local_binary_pattern, greycomatrix, greycoprops, hog
+    from skimage.color import rgb2gray
+    SKIMAGE_AVAILABLE = True
+    print("scikit-image found. LBP, GLCM, and HOG features will be enabled.")
+except ImportError:
+    SKIMAGE_AVAILABLE = False
+    print("Warning: scikit-image not found. LBP, GLCM, and HOG features will be disabled (vectors of zeros).")
+
+try:
+    import pywt
+    PYWT_AVAILABLE = True
+    print("PyWavelets found. Wavelet features will be enabled.")
+except ImportError:
+    PYWT_AVAILABLE = False
+    print("Warning: PyWavelets not found. Wavelet features will be disabled (vectors of zeros).")
+
+# Change directory to the script's location
+# This helps ensure relative paths like "AID" work correctly
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+print(f"Working directory set to: {script_dir}")
+
+
+# --- Manual configuration ---
+DATASET_PATH = "UC Land"  # Dataset folder in the same directory
+OUTFILE_PATH = "features_ucl.npz"
+# Set to True to compute and concatenate all handcrafted features
+CONCAT_EXTRA_FEATURES = True
+# Fixed HOG dimension based on 224x224 input
+# (224/16)-1 = 13 blocks -> 13x13=169 block positions
+# 169 * (2x2 cells/block) * 9 orientations = 6084
+HOG_DIM = 6084
+
+
+# --- Load Pre-trained VGG16 model ---
+print("Loading VGG16 pre-trained model...")
+# We use the pre-trained VGG16 model but remove the final fully connected layers
+vgg16 = models.vgg16(pretrained=True)
+# The features part of VGG16 is what we need.
+feature_extractor = nn.Sequential(*list(vgg16.features.children()))
+# We also add the Adaptive Average Pooling layer that comes after the features.
+# Note: For VGG16, .features output is (512, 7, 7), so .avgpool also gives (512, 7, 7)
+# We will apply our own global average pooling later.
+feature_extractor.add_module('avgpool', vgg16.avgpool)
+# Set the model to evaluation mode
+feature_extractor.eval()
+
+# Check for CUDA availability and move the model to GPU if possible
+if torch.cuda.is_available():
+    print("Using GPU for deep feature extraction.")
+    feature_extractor.cuda()
+else:
+    print("Using CPU for deep feature extraction.")
+
+
+# --- Image Transformations ---
+# Define the transformations that will be applied to each image.
+# The images must be resized and normalized as expected by the VGG16 model.
+scaler = transforms.Resize((224, 224))
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+to_tensor = transforms.ToTensor()
+
+
+def get_vector(image_path):
+    """
+    This function takes the path of an image, applies the necessary transformations,
+    and returns a concatenated vector of deep features (VGG16-GAP)
+    and various handcrafted features.
+    """
+    try:
+        # 1. Open the image
+        img = Image.open(image_path).convert('RGB')  # Ensure image is in RGB
+
+        # 2. Apply transformations for VGG
+        img_224 = scaler(img)  # Save the 224x224 PIL image for later
+        t_img = Variable(normalize(to_tensor(img_224))).unsqueeze(0)
+
+        # 3. Move tensor to GPU if available
+        if torch.cuda.is_available():
+            t_img = t_img.cuda()
+
+        # 4. Get the convolutional feature map from VGG
+        # features shape: (1, 512, 7, 7)
+        with torch.no_grad():
+            features = feature_extractor(t_img)
+
+        # 5. Convert conv feature map into a 512-dim Global Average Pooling (GAP) descriptor
+        with torch.no_grad():
+            gp = features.mean(dim=(2, 3)).squeeze(0)
+        deep_features = gp.cpu().data.numpy()
+
+        if not CONCAT_EXTRA_FEATURES:
+            return deep_features
+
+        # --- 6. Compute handcrafted features ---
+        
+        # Create OpenCV/Numpy versions of the images
+        # Original size image for features where scale matters (texture, shape)
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        
+        # Resized 224x224 image for HOG to ensure a fixed-size vector
+        img_224_cv = cv2.cvtColor(np.array(img_224), cv2.COLOR_RGB2BGR)
+        gray_224 = cv2.cvtColor(img_224_cv, cv2.COLOR_BGR2GRAY)
+
+        # List to store all handcrafted feature vectors
+        handcrafted = []
+
+        # 6.a Color histograms (from original size image) (16*3 = 48 dims)
+        chans = cv2.split(img_cv)
+        color_hist_features = []
+        for ch in chans:
+            hist = cv2.calcHist([ch], [0], None, [16], [0, 256]).flatten()
+            hist = hist / (hist.sum() + 1e-8)  # Normalize
+            color_hist_features.append(hist)
+        handcrafted.append(np.concatenate(color_hist_features))
+
+        # 6.b Grayscale histogram (from original size image) (32 dims)
+        gray_hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).flatten()
+        gray_hist = gray_hist / (gray_hist.sum() + 1e-8)
+        handcrafted.append(gray_hist)
+
+        # 6.c LBP histogram (from original size image) (59 dims)
+        if SKIMAGE_AVAILABLE:
+            try:
+                lbp = local_binary_pattern(gray, P=8, R=1, method='uniform')
+                n_bins = int(lbp.max() + 1)
+                lbp_hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins))
+                lbp_hist = lbp_hist / (lbp_hist.sum() + 1e-8)
+            except Exception:
+                lbp_hist = np.zeros(59)  # 59 bins for 'uniform' with P=8
+        else:
+            lbp_hist = np.zeros(59)
+        handcrafted.append(lbp_hist)
+
+        # 6.d GLCM properties (from original size image) (6*4 = 24 dims)
+        if SKIMAGE_AVAILABLE:
+            try:
+                gray_q = (gray / 32).astype('uint8')  # Quantize to 8 levels
+                glcm = greycomatrix(gray_q, distances=[1], angles=[0, math.pi / 4, math.pi / 2, 3 * math.pi / 4], levels=8, symmetric=True, normed=True)
+                props = ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']
+                glcm_feats = []
+                for p in props:
+                    v = greycoprops(glcm, p).ravel()
+                    glcm_feats.append(v)
+                glcm_feats = np.concatenate(glcm_feats)
+            except Exception:
+                glcm_feats = np.zeros(6 * 4)  # 6 props, 4 angles
+        else:
+            glcm_feats = np.zeros(6 * 4)
+        handcrafted.append(glcm_feats)
+
+        # 6.e Hu moments (from original size image) (7 dims)
+        try:
+            moments = cv2.moments(gray)
+            hu = cv2.HuMoments(moments).flatten()
+            # Log scale stabilization
+            for i in range(len(hu)):
+                if hu[i] != 0:
+                    hu[i] = -1 * np.sign(hu[i]) * np.log10(abs(hu[i]))
+            hu = np.nan_to_num(hu)
+        except Exception:
+            hu = np.zeros(7)
+        handcrafted.append(hu)
+
+        # 6.f HOG (from *resized* 224x224 image for fixed vector size) (6084 dims)
+        if SKIMAGE_AVAILABLE:
+            try:
+                hog_feat = hog(gray_224, pixels_per_cell=(16, 16), cells_per_block=(2, 2), feature_vector=True)
+                if hog_feat.shape[0] != HOG_DIM:
+                    # Handle potential edge case if image wasn't exactly 224
+                    if hog_feat.shape[0] < HOG_DIM:
+                        hog_feat = np.pad(hog_feat, (0, HOG_DIM - hog_feat.shape[0]), 'constant')
+                    else:
+                        hog_feat = hog_feat[:HOG_DIM]
+            except Exception as e:
+                # print(f"HOG Error: {e}") # Uncomment for debugging
+                hog_feat = np.zeros(HOG_DIM)
+        else:
+            hog_feat = np.zeros(HOG_DIM)
+        handcrafted.append(hog_feat)
+
+        # 6.g Wavelet energies (from original size image) (6 dims)
+        if PYWT_AVAILABLE:
+            try:
+                arr = gray.astype(float)
+                coeffs = pywt.wavedec2(arr, 'db1', level=2)
+                energies = []
+                # coeffs[0] is cA2, coeffs[1:] are details (cH2,cV2,cD2), (cH1,cV1,cD1)
+                for level in coeffs[1:]:  # 2 levels of detail
+                    for band in level:  # 3 bands (H, V, D)
+                        energies.append(np.sum(np.abs(band)))
+                wave_feats = np.array(energies)
+                if wave_feats.size != 6:  # Should be 2*3=6
+                    wave_feats = np.zeros(6)
+            except Exception:
+                wave_feats = np.zeros(6)
+        else:
+            wave_feats = np.zeros(6)
+        handcrafted.append(wave_feats)
+
+        # concatenate all handcrafted features
+        handcrafted_vec = np.concatenate([np.ravel(x) for x in handcrafted])
+
+        # 7. Final feature vector: deep features + handcrafted
+        final = np.concatenate([deep_features.ravel(), handcrafted_vec.ravel()])
+        return final
+
+    except Exception as e:
+        print(f"Error processing image {image_path}: {e}")
+        return None
+
+
+def extract_features(dataset_path):
+    """
+    Iterates through the dataset folders, extracts features for each image,
+    and returns the features and corresponding labels.
+    """
+    print("Starting feature extraction...")
+    all_features = []
+    all_labels = []
+    
+    class_names = sorted([d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))])
+    
+    if not class_names:
+        print(f"Error: No subdirectories found in '{dataset_path}'.")
+        print("Expected structure: 'AID/ClassName1/image1.jpg', 'AID/ClassName2/image2.jpg', ...")
+        return np.array([]), np.array([])
+
+    # The dataset is expected to have one folder per class
+    for class_label, class_name in enumerate(class_names):
+        class_path = os.path.join(dataset_path, class_name)
+        
+        print(f"Processing class: {class_name} (Label: {class_label})")
+
+        image_files = sorted([f for f in os.listdir(class_path) if os.path.isfile(os.path.join(class_path, f))])
+        
+        if not image_files:
+            print(f"Warning: No image files found in '{class_path}'")
+            continue
+            
+        img_count = 0
+        for image_name in image_files:
+            # Check for common image file extensions
+            if not image_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')):
+                continue
+                
+            image_path = os.path.join(class_path, image_name)
+
+            # Get the feature vector for the image
+            feature_vector = get_vector(image_path)
+
+            if feature_vector is not None:
+                all_features.append(feature_vector)
+                all_labels.append(class_label)
+                img_count += 1
+        
+        print(f"  ...extracted features from {img_count} images.")
+
+    print("Feature extraction completed.")
+    return np.array(all_features), np.array(all_labels)
+
+
+if __name__ == '__main__':
+    if not os.path.isdir(DATASET_PATH):
+        print(f"Error: Dataset directory not found at '{DATASET_PATH}'")
+        print(f"Please make sure the '{DATASET_PATH}' folder is in the same directory as this script.")
+    else:
+        features, labels = extract_features(DATASET_PATH)
+        
+        if features.size > 0 and labels.size > 0:
+            print(f"\nTotal features extracted: {features.shape[0]}")
+            print(f"Dimension of each feature vector: {features.shape[1]}")
+            
+            print(f"\nSaving features and labels to '{OUTFILE_PATH}'...")
+            np.savez_compressed(OUTFILE_PATH, features=features, labels=labels)
+            print("Done.")
+        else:
+            print("\nNo features were extracted. Please check the dataset directory and image files.")
