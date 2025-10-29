@@ -2,7 +2,7 @@ import numpy as np
 import os
 
 # --- IMPORTANT: Make sure this name matches your file EXACTLY ---
-filename = 'features_convnext_fetus.npz'
+filename = 'xray_features.npz'
 
 # 1. Check if the file exists
 if not os.path.exists(filename):
